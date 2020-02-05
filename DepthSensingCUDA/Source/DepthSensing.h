@@ -1,4 +1,5 @@
 ﻿#pragma once
+#pragma comment(lib, "legacy_stdio_definitions.lib")
 
 #include <windows.h>
 #include <d3d11.h>
@@ -43,6 +44,7 @@
 #include "CUDASceneRepChunkGrid.h"
 
 #include <iomanip>
+
 
 #ifdef KINECT
 #pragma comment(lib, "Kinect10.lib")

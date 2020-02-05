@@ -11,6 +11,34 @@ KinectSensor::KinectSensor()
 	DWORD width = 0;
 	DWORD height = 0;
 
+	// check available device
+	if (torch::cuda::is_available()) {
+		std::cout << "CUDA is available! Run on GPU." << std::endl;
+		device = at::kCUDA;
+	}
+
+	// select target
+	for (unsigned int g = 0; g < labels.size(); g++) {
+		if (labels.at(g) == "person") {
+			target = g;
+			break;
+		}
+	}
+
+	// load model
+	std::cout << "Loading the module..." << std::endl;
+	try {
+		// Deserialize the ScriptModule from a file & move to desired device
+		module = torch::jit::load("Models/model_traceable.pt", device);
+
+		// Evaluation mode
+		module.eval();
+	}
+	catch (const c10::Error & e) {
+		std::cerr << "Error while loading the model: " << e.what() << std::endl;
+		exit(-1);
+	}
+
 	NuiImageResolutionToSize(cDepthResolution, width, height);
 	unsigned int depthWidth = static_cast<unsigned int>(width);
 	unsigned int depthHeight = static_cast<unsigned int>(height);
@@ -91,8 +119,8 @@ HRESULT KinectSensor::createFirstConnected()
 	}
 
 	// Initialize the Kinect and specify that we'll be using depth
-	//hr = m_pNuiSensor->NuiInitialize(NUI_INITIALIZE_FLAG_USES_COLOR | NUI_INITIALIZE_FLAG_USES_DEPTH_AND_PLAYER_INDEX); 
-	hr = m_pNuiSensor->NuiInitialize(NUI_INITIALIZE_FLAG_USES_COLOR | NUI_INITIALIZE_FLAG_USES_DEPTH); 
+	//hr = m_pNuiSensor->NuiInitialize(NUI_INITIALIZE_FLAG_USES_COLOR | NUI_INITIALIZE_FLAG_USES_DEPTH_AND_PLAYER_INDEX);
+	hr = m_pNuiSensor->NuiInitialize(NUI_INITIALIZE_FLAG_USES_COLOR | NUI_INITIALIZE_FLAG_USES_DEPTH);
 	if (FAILED(hr) ) { return hr; }
 
 	// Create an event that will be signaled when depth data is available
@@ -154,6 +182,87 @@ HRESULT KinectSensor::createFirstConnected()
 	//toggleAutoWhiteBalance();
 
 	return hr;
+}
+
+void KinectSensor::benchmarkMask(torch::jit::script::Module & model) {
+	std::vector<torch::jit::IValue> inputs;
+	at::Tensor input = at::zeros({ 1, 3, 480, 640 }, torch::kCUDA);
+
+	inputs.push_back(input);
+
+	std::cout << "Feed Forwarding..." << std::endl;
+	const clock_t begin_time = clock();
+	auto output = model.forward({ input });
+
+	std::cout << float(clock() - begin_time) / CLOCKS_PER_SEC << std::endl;
+}
+
+void KinectSensor::processMask() {
+	// Create a vector of inputs.
+	// at::Tensor input = torch::zeros({ 1, 3, 480, 640 }, torch::kCPU);
+	clock_t begin_time = clock();
+
+	typedef float dimensions[3][480][640];
+	dimensions * data = new dimensions[1];
+	for (int y = 0; y < (int)getColorHeight(); y++) {
+		LONG * pDest = ((LONG *)m_colorRGBX) + (int)getColorWidth() * y;
+		for (int x = 0; x < (int)getColorWidth(); x++) {
+			LONG & pixel = *pDest;
+
+			std::vector<int> color = {
+				(pixel & 0x00FF0000) >> 16,
+				(pixel & 0x0000FF00) >> 8,
+				(pixel & 0x000000FF)
+			};
+
+			for (unsigned int c = 0; c < color.size(); c++) {
+				int& channel = color[c];
+				int index = ((x * getColorHeight()) + y * getColorHeight()) * c;
+
+				data[0][c][y][x] = (((float)channel / 255.0f) - mean[c]) / sd[c];
+			}
+
+			pDest++;
+		}
+	}
+
+	torch::Tensor input = torch::from_blob(data, { 1, 3, 480, 640 });
+	auto output = module.forward({ input.to(device) });
+
+	// Execute the model and turn its output into a tensor.
+	if (output.isTensor()) {
+		// case when output is a dictionary - isGenericDict
+		// c10::Dict<torwch::IValue, torch::IValue> dict = output.toGenericDict();
+		// at::Tensor & out = dict.find(torch::IValue("out"))->value().toTensor();
+		at::Tensor & out = output.toTensor();
+
+		// masks
+		at::Tensor color_mask = out[0].argmax(0) != target;
+		at::Tensor threshold_mask = out[0][target] < sensibility;
+
+		// total mask -> threshold mask + color mask
+		at::Tensor mask = (color_mask + threshold_mask);
+
+		bool * m = mask.to(torch::kCPU).data<bool>();
+
+		// apply mask
+		for (int y = 0; y < (int)getColorHeight(); y++) {
+			LONG* pDest = ((LONG*)m_colorRGBX) + (int)getColorWidth() * y;
+			for (int x = 0; x < (int)getColorWidth(); x++) {
+				if (m[y * 640 +x]) {
+					*pDest = 0x00000000;
+				}
+
+				pDest++;
+			}
+		}
+
+		delete[] data;
+	}
+	else {
+		exit(-1);
+	}
+
 }
 
 HRESULT KinectSensor::processDepth()
@@ -264,7 +373,7 @@ HRESULT KinectSensor::processColor()
 				//LONG colorIndex = colorInDepthY * (int)getColorWidth() + (getColorWidth() - 1 - colorInDepthX);
 
 				// set source for copy to the color pixel
-				LONG* pSrc = ((LONG *)LockedRect.pBits) + colorIndex;					
+				LONG* pSrc = ((LONG *)LockedRect.pBits) + colorIndex;
 				LONG tmp = *pSrc;
 				vec4uc* bgr = (vec4uc*)&tmp;
 				std::swap(bgr->x, bgr->z);
@@ -279,6 +388,9 @@ HRESULT KinectSensor::processColor()
 		}
 	}
 
+	// process mask
+	this->processMask();
+	// KinectSensor::benchmarkMask(this->module);
 
 	hr = imageFrame.pFrameTexture->UnlockRect(0);
 	if ( FAILED(hr) ) { return hr; };
